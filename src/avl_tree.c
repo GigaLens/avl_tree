@@ -11,13 +11,23 @@ typedef struct tagAvlNode {
     int bFactor;       /* 当前子树的平衡因子 */
     void *key;         /* 数据键值 */
     void *data;        /* 存储的数据 */
+    uint8_t buff[0];   /* 保存key和data的变长数组 */
 } AVL_NODE_S;
 
 /* avl树结构体定义 */
 typedef struct tagAvlTree {
-    AVL_NODE_S *root;
+    AVL_NODE_S dumRoot;
     COMPARE_FUNC cmpFunc;
 } AVL_TREE_S;
+
+/* 子女类型，左子女或者右子女 */
+typedef enum {
+    AVL_LEFT = 0,
+    AVL_RIGHT = 1
+} AvlChildType;
+
+/* key或data长度不超过32字节，则使用循环赋值的方式拷贝 */
+#define AVL_BYTES_COPY_LEN 32
 
 /* 创建avl树 */
 AVL_TREE_S *AvlTreeCreate(COMPARE_FUNC cmpFunc)
@@ -28,32 +38,36 @@ AVL_TREE_S *AvlTreeCreate(COMPARE_FUNC cmpFunc)
 
     AVL_TREE_S *pAvlTree = (AVL_TREE_S *)malloc(sizeof(AVL_TREE_S));
     if (pAvlTree != NULL) {
-        pAvlTree->root = NULL;
+        (void)memset(pAvlTree, 0, sizeof(AVL_TREE_S));
         pAvlTree->cmpFunc = cmpFunc; /* 设置为用户提供的比较函数 */
     }
 
     return pAvlTree;
 }
 
-/* 生成avl树节点 */
-AVL_NODE_S *AvlNodeAlloc(void *key, unsigned int keyLen, void *data, unsigned int dataLen)
+static inline AvlBytesCopy(void *dst, void *src, uint32_t len)
 {
-    /* 入参的合法性由上层调用保证 */
-    void *pKey = malloc(keyLen);
-    if (pKey == NULL) {
-        return NULL;
-    }
+    uint32_t i;
+    uint8_t *curDst = (uint8_t *)dst;
+    uint8_t *curSrc = (uint8_t *)src;
 
-    void *pData = malloc(dataLen);
-    if (pData == NULL) {
-        free(pKey);
-        return NULL;
+    for (i = 0; i < len; i++) {
+        *curDst = *curSrc;
+        curDst++;
+        curSrc++;
     }
+}
 
-    AVL_NODE_S *pAvlNode = (AVL_NODE_S *)malloc(sizeof(AVL_NODE_S));
+/* 生成avl树节点 */
+AVL_NODE_S *AvlNodeAlloc(void *key, uint32_t keyLen, void *data, uint32_t dataLen)
+{
+    void *dst;
+    AVL_NODE_S *pAvlNode;
+    size_t nodeSize = sizeof(AVL_NODE_S) + (size_t)keyLen + (size_t)dataLen;
+
+    /* 入参合法性由上层调用保证 */
+    pAvlNode = (AVL_NODE_S *)malloc(nodeSize);
     if (pAvlNode == NULL) {
-        free(pKey);
-        free(pData);
         return NULL;
     }
 
@@ -63,10 +77,21 @@ AVL_NODE_S *AvlNodeAlloc(void *key, unsigned int keyLen, void *data, unsigned in
     pAvlNode->height = 1;
     pAvlNode->bFactor = 0;
 
-    (void)memcpy(pKey, key, keyLen);
-    (void)memcpy(pData, data, dataLen);
-    pAvlNode->key = pKey;
-    pAvlNode->data = pData;
+    dst = (void *)(pAvlNode + 1);
+    if (keyLen <= AVL_BYTES_COPY_LEN) {
+        AvlBytesCopy(dst, key, keyLen);
+    } else {
+        (void)memcpy(dst, key, keyLen);
+    }
+    pAvlNode->key = dst;
+
+    dst = (void *)((uint8_t *)dst + keyLen);
+    if (dataLen < AVL_BYTES_COPY_LEN) {
+        AvlBytesCopy(dst, data, dataLen);
+    } else {
+        (void)memcpy(dst, data, dataLen);
+    }
+    pAvlNode->data = dst;
 
     return pAvlNode;
 }
@@ -74,15 +99,12 @@ AVL_NODE_S *AvlNodeAlloc(void *key, unsigned int keyLen, void *data, unsigned in
 /* 释放avl树节点内存 */
 void AvlNodeFree(AVL_NODE_S *pAvlNode)
 {
-    free(pAvlNode->key);
-    free(pAvlNode->data);
+    /* 由上层调用保证pAvlNode非空 */
     free(pAvlNode);
-
-    return;
 }
 
 /* 设置avl节点平衡因子和高度(指以本节点为根的子树的高度) */
-void AvlBalanceAndHeightSet(AVL_NODE_S *pAvlNode)
+static inline void AvlBalanceAndHeightSet(AVL_NODE_S *pAvlNode)
 {
     int leftHeight = 0;
     int rightHeight = 0;
@@ -97,132 +119,91 @@ void AvlBalanceAndHeightSet(AVL_NODE_S *pAvlNode)
 
     pAvlNode->height = 1 + ((leftHeight > rightHeight) ? leftHeight : rightHeight);
     pAvlNode->bFactor = rightHeight - leftHeight;
-
-    return;
 }
 
 /* 左单旋 */
-void AvlRotateLeft(AVL_NODE_S **ppHead)
+void AvlRotateLeft(AVL_NODE_S **ppRoot)
 {
-    AVL_NODE_S *pHeadPre = *ppHead;
-    AVL_NODE_S *pHeadNew = pHeadPre->right;
+    AVL_NODE_S *pOldRoot = *ppRoot; 
+    AVL_NODE_S *pNewRoot = pOldRoot->right;
+    AVL_NODE_S *pGrand = pOldRoot->parent;
 
-    if (pHeadNew->left != NULL) {
-        pHeadNew->left->parent = pHeadPre;
+    /* 先修改旧根结点的右子树 */
+    if (pNewRoot->left != NULL) {
+        pNewRoot->left->parent = pOldRoot;
     }
-    pHeadPre->right = pHeadNew->left;
+    pOldRoot->right = pNewRoot->left;
 
-    pHeadNew->parent = pHeadPre->parent;
-    pHeadPre->parent = pHeadNew;
-    pHeadNew->left = pHeadPre;
+    /* 链接新根结点的左边子树 */
+    pNewRoot->left = pOldRoot;
+    pOldRoot->parent = pNewRoot;
 
-    AvlBalanceAndHeightSet(pHeadPre);
-    AvlBalanceAndHeightSet(pHeadNew);
+    /* 修改祖父结点的链接 */
+    pNewRoot->parent = pGrand;
+    *ppRoot = pNewRoot;
 
-    *ppHead = pHeadNew;
-
-    return;
+    /* 树高度和平衡因子更新 */
+    AvlBalanceAndHeightSet(pOldRoot);
+    AvlBalanceAndHeightSet(pNewRoot);
 }
 
 /* 右单旋 */
-void AvlRotateRight(AVL_NODE_S **ppHead)
+void AvlRotateRight(AVL_NODE_S **ppRoot)
 {
-    AVL_NODE_S *pHeadPre = *ppHead;
-    AVL_NODE_S *pHeadNew = pHeadPre->left;
+    AVL_NODE_S *pOldRoot = *ppRoot; 
+    AVL_NODE_S *pNewRoot = pOldRoot->left;
+    AVL_NODE_S *pGrand = pOldRoot->parent;
 
-    if (pHeadNew->right != NULL) {
-        pHeadNew->right->parent = pHeadPre;
+    /* 先修改旧根结点的左子树 */
+    if (pNewRoot->right != NULL) {
+        pNewRoot->right->parent = pOldRoot;
     }
+    pOldRoot->left = pNewRoot->right;
 
-    pHeadPre->left = pHeadNew->right;
+    /* 链接新根结点的右子树 */
+    pNewRoot->right = pOldRoot;
+    pOldRoot->parent = pNewRoot;
 
-    pHeadNew->parent = pHeadPre->parent;
-    pHeadPre->parent = pHeadNew;
-    pHeadNew->right = pHeadPre;
+    /* 修改祖父结点的链接 */
+    pNewRoot->parent = pGrand;
+    *ppRoot = pNewRoot;
 
-    AvlBalanceAndHeightSet(pHeadPre);
-    AvlBalanceAndHeightSet(pHeadNew);
-
-    *ppHead = pHeadNew;
-
-    return;
+    /* 修改树高度和平衡因子 */
+    AvlBalanceAndHeightSet(pOldRoot);
+    AvlBalanceAndHeightSet(pNewRoot);
 }
 
 /* 先左后右双旋转 */
-void AvlRotateLeftRight(AVL_NODE_S **ppHead)
+void AvlRotateLeftRight(AVL_NODE_S **ppRoot)
 {
-    AVL_NODE_S *pHeadNew = (*ppHead)->left->right;
-    AVL_NODE_S *pLeftNew = (*ppHead)->left;
-    AVL_NODE_S *pRightNew = *ppHead;
-    
-    if (pHeadNew->right != NULL) {
-        pHeadNew->right->parent = pRightNew;
-    }
-    pRightNew->left = pHeadNew->right;
+    AVL_NODE_S *pRoot = *ppRoot;
 
-    if (pHeadNew->left != NULL) {
-        pHeadNew->left->parent = pLeftNew;
-    }
-    pLeftNew->right = pHeadNew->left;
+    /* 先左单旋左子树 */
+    AvlRotateLeft(&(pRoot->left));
 
-    pHeadNew->parent = pRightNew->parent;
-
-    pLeftNew->parent = pHeadNew;
-    pHeadNew->left = pLeftNew;
-
-    pRightNew->parent = pHeadNew;
-    pHeadNew->right = pRightNew;
-
-    AvlBalanceAndHeightSet(pLeftNew);
-    AvlBalanceAndHeightSet(pRightNew);
-    AvlBalanceAndHeightSet(pHeadNew);
-
-    *ppHead = pHeadNew;
-
-    return;
+    /* 再右单旋当前树 */
+    AvlRotateRight(ppRoot);
 }
 
 /* 先右后左双旋转 */
-void AvlRotateRightLeft(AVL_NODE_S **ppHead)
+void AvlRotateRightLeft(AVL_NODE_S **ppRoot)
 {
-    AVL_NODE_S *pHeadNew = (*ppHead)->right->left;
-    AVL_NODE_S *pLeftNew = *ppHead;
-    AVL_NODE_S *pRightNew = (*ppHead)->right;
-    
-    if (pHeadNew->left != NULL) {
-        pHeadNew->left->parent = pLeftNew;
-    }
-    pLeftNew->right = pHeadNew->left;
-    
-    if (pHeadNew->right != NULL) {
-        pHeadNew->right->parent = pRightNew;
-    }
-    pRightNew->left = pHeadNew->right;
+    AVL_NODE_S *pRoot = *ppRoot;
 
-    pHeadNew->parent = pLeftNew->parent;
+    /* 先右单旋右子树 */
+    AvlRotateRight(&(pRoot->right));
 
-    pLeftNew->parent = pHeadNew;
-    pHeadNew->left = pLeftNew;
-
-    pRightNew->parent = pHeadNew;
-    pHeadNew->right = pRightNew;
-
-    AvlBalanceAndHeightSet(pLeftNew);
-    AvlBalanceAndHeightSet(pRightNew);
-    AvlBalanceAndHeightSet(pHeadNew);
-
-    *ppHead = pHeadNew;
-
-    return;
+    /* 再左单旋当前树 */
+    AvlRotateLeft(ppRoot);
 }
 
 /* 单旋转 */
 void AvlRotateSingle(AVL_NODE_S **ppHead, int bFactor)
 {
     if (bFactor > 0) {
-        return AvlRotateLeft(ppHead);
+        AvlRotateLeft(ppHead);
     } else {
-        return AvlRotateRight(ppHead);
+        AvlRotateRight(ppHead);
     }
 }
 
@@ -230,20 +211,19 @@ void AvlRotateSingle(AVL_NODE_S **ppHead, int bFactor)
 void AvlRotateDual(AVL_NODE_S **ppHead, int bFactor)
 {
     if (bFactor > 0) {
-        return AvlRotateLeftRight(ppHead);
+        AvlRotateLeftRight(ppHead);
     } else {
-        return AvlRotateRightLeft(ppHead);
+        AvlRotateRightLeft(ppHead);
     }
 }
 
 /* 旋转平衡操作 */
-AVL_NODE_S *AvlRotateBalance(AVL_NODE_S *pCur, int bFactor, int cbFactor, AVL_NODE_S **ppRoot)
+AVL_NODE_S *AvlRotateBalance(AVL_NODE_S *pCur, int bFactor, int cbFactor)
 {
     AVL_NODE_S **ppCur;
 
-    if (pCur->parent == NULL) {
-        ppCur = ppRoot;
-    } else if (pCur->parent->left == pCur) {
+    /* 使用dumy root结点，上层调用保证pCur->parent不为空 */
+    if (pCur->parent->left == pCur) {
         ppCur = &(pCur->parent->left);
     } else {
         ppCur = &(pCur->parent->right);
@@ -261,20 +241,18 @@ AVL_NODE_S *AvlRotateBalance(AVL_NODE_S *pCur, int bFactor, int cbFactor, AVL_NO
 }
 
 /* avl插入节点后的平衡操作 */
-void AvlTreeInsertBalance(AVL_NODE_S **ppRoot, AVL_NODE_S *pNode)
+void AvlTreeInsertBalance(AVL_NODE_S *pNode, AVL_NODE_S *pDumRoot)
 {
     int bFactor;
     AVL_NODE_S *pCur;
     AVL_NODE_S *pChild;
 
-    if (pNode == NULL) {
-        return;
-    }
-
+    /* 上层调用保证pNode一定不为空 */
     pChild = pNode;
     pCur = pNode->parent;
 
-    while (pCur != NULL) {
+    /* 当前结点非dumRoot则继续回溯 */
+    while (pCur != pDumRoot) {
         AvlBalanceAndHeightSet(pCur);
         bFactor = pCur->bFactor;
         if (bFactor == 0) {
@@ -282,26 +260,24 @@ void AvlTreeInsertBalance(AVL_NODE_S **ppRoot, AVL_NODE_S *pNode)
             break;
         }
 
-        if ((bFactor > 1) || (bFactor < -1)) {
+        if ((bFactor > 1) || (bFactor < (-1))) {
             /* 旋转平衡处理 */
-            pCur = AvlRotateBalance(pCur, bFactor, pChild->bFactor, ppRoot);
+            pCur = AvlRotateBalance(pCur, bFactor, pChild->bFactor);
         }
 
         pChild = pCur;
         pCur = pCur->parent;
     }
-
-    return;
 }
 
 /* 插入节点 */
-int AvlTreeInsert(AVL_TREE_S *pAvlTree, void *key, unsigned int keySize, void *data,
-    unsigned int dataSize)
+int AvlTreeInsert(AVL_TREE_S *pAvlTree, void *key, uint32_t keySize, void *data,
+    uint32_t dataSize)
 {
     /* 检查入参合法性 */
     /* 应该还需要检查比较函数是否为空 */
-    if ((pAvlTree == NULL) || (key == NULL) || (keySize == 0) || (data == NULL) ||
-        (dataSize == 0)) {
+    if ((pAvlTree == NULL) || (pAvlTree->cmpFunc == NULL) || (key == NULL) || (keySize == 0) ||
+        (data == NULL) || (dataSize == 0)) {
         return AVL_ERR;
     }
 
@@ -311,19 +287,22 @@ int AvlTreeInsert(AVL_TREE_S *pAvlTree, void *key, unsigned int keySize, void *d
     }
 
     /* 树为空 */
-    if (pAvlTree->root == NULL) {
-        pAvlTree->root = pNewNode;
+    if (pAvlTree->dumRoot.left == NULL) {
+        pAvlTree->dumRoot.left = pNewNode;
+        pNewNode->parent = &pAvlTree->dumRoot;
         return AVL_OK;
     }
 
     int cmpRet;
     AVL_NODE_S *pParent;
-    AVL_NODE_S *pNode = pAvlTree->root;
+    AVL_NODE_S *pNode = pAvlTree->dumRoot.left;
     COMPARE_FUNC pfnCmp = pAvlTree->cmpFunc;
     while (pNode != NULL) {
         cmpRet = pfnCmp(key, pNode->key);
         if (cmpRet == 0) {
             /* 结点存在则直接返回 */
+            /* 释放内存 */
+            AvlNodeFree(pNewNode);
             return AVL_OK;
         }
 
@@ -342,8 +321,7 @@ int AvlTreeInsert(AVL_TREE_S *pAvlTree, void *key, unsigned int keySize, void *d
     }
     pNewNode->parent = pParent;
 
-    AvlTreeInsertBalance(&pAvlTree->root, pNewNode);
-
+    AvlTreeInsertBalance(pNewNode, &pAvlTree->dumRoot);
     return AVL_OK;
 }
 
@@ -352,7 +330,7 @@ AVL_NODE_S *AvlNodeFind(AVL_TREE_S *pAvlTree, void *key)
 {
     int cmpRet;
     COMPARE_FUNC cmpFunc = pAvlTree->cmpFunc;
-    AVL_NODE_S *pAvlNode = pAvlTree->root;
+    AVL_NODE_S *pAvlNode = pAvlTree->dumRoot.left;
 
     while (pAvlNode != NULL) {
         cmpRet = cmpFunc(key, pAvlNode->key);
@@ -380,68 +358,6 @@ AVL_NODE_S *AvlPreNodeFind(AVL_NODE_S *pAvlNode)
     return pPreNode;
 }
 
-/* 替换avl树节点 */
-void AvlNodeReplace(AVL_NODE_S *pAvlNodeOld, AVL_NODE_S *pAvlNodeNew, AVL_NODE_S **ppRoot)
-{
-    AVL_NODE_S *pParent;
-
-    pAvlNodeNew->parent = pAvlNodeOld->parent;
-    pAvlNodeNew->left = pAvlNodeOld->left;
-    pAvlNodeNew->right = pAvlNodeOld->right;
-
-    if (pAvlNodeOld->left != NULL) {
-        pAvlNodeOld->left->parent = pAvlNodeNew;
-    }
-
-    if (pAvlNodeOld->right != NULL) {
-        pAvlNodeOld->right->parent = pAvlNodeNew;
-    }
-
-    pParent = pAvlNodeOld->parent;
-    if (pParent != NULL) {
-        if (pParent->left == pAvlNodeOld) {
-            pParent->left = pAvlNodeNew;
-        } else {
-            pParent->right = pAvlNodeNew;
-        }
-    } else {
-        /* 父节点为空说明为根节点 */
-        *ppRoot = pAvlNodeNew;
-    }
-
-    return;
-}
-
-/* 删除最多只有一个子女的avl树节点 */
-void AvlEdgeNodeRemove(AVL_NODE_S *pAvlNode, AVL_NODE_S **ppRoot)
-{
-    AVL_NODE_S *pChild;
-    AVL_NODE_S *pParent = pAvlNode->parent;
-
-    if (pAvlNode->left != NULL) {
-        pChild = pAvlNode->left;
-    } else {
-        pChild = pAvlNode->right;
-    }
-
-    if (pChild != NULL) {
-        pChild->parent = pParent;
-    }
-
-    if (pParent != NULL) {
-        if (pParent->left == pAvlNode) {
-            pParent->left = pChild;
-        } else {
-            pParent->right = pChild;
-        }
-    } else {
-        /* 父节点为空说明为根节点 */
-        *ppRoot = pChild;
-    }
-
-    return;
-}
-
 /* 获取高度更高的子树节点 */
 AVL_NODE_S *AvlGetHigherChild(AVL_NODE_S *pNode)
 {
@@ -460,14 +376,14 @@ AVL_NODE_S *AvlGetHigherChild(AVL_NODE_S *pNode)
 }
 
 /* 删除节点后再平衡 */
-void AvlTreeRemoveBalance(AVL_NODE_S *pNode, AVL_NODE_S **ppRoot)
+void AvlTreeRemoveBalance(AVL_NODE_S *pNode, AVL_NODE_S *pDumRoot)
 {
     AVL_NODE_S *pCur = pNode;
     AVL_NODE_S *pChild;
     int preHeight;
     int bFactor;
 
-    while (pCur != NULL) {
+    while (pCur != pDumRoot) {
         preHeight = pCur->height;
         AvlBalanceAndHeightSet(pCur);
         if (pCur->height == preHeight) {
@@ -476,26 +392,73 @@ void AvlTreeRemoveBalance(AVL_NODE_S *pNode, AVL_NODE_S **ppRoot)
         }
 
         bFactor = pCur->bFactor;
-        if ((bFactor > 1) || (bFactor < -1)) {
+        if ((bFactor > 1) || (bFactor < (-1))) {
             /* 此处pChild一定不为空 */
             pChild = AvlGetHigherChild(pCur);
-            pCur = AvlRotateBalance(pCur, bFactor, pChild->bFactor, ppRoot);
+            pCur = AvlRotateBalance(pCur, bFactor, pChild->bFactor);
         }
         pCur = pCur->parent;
     }
-
-    return;
 }
 
-/* 删除节点 */
+void AvlNodeTransplant(AVL_NODE_S *pNode, AVL_NODE_S **ppParent,
+    AvlChildType *pChildType, AVL_NODE_S **ppNewChild)
+{
+    AvlChildType childType = *pChildType;
+    AVL_NODE_S *pPreNode;
+    AVL_NODE_S *pNewChild;
+    AVL_NODE_S *pParent = *ppParent;
+    AVL_NODE_S *pNewParent;
+    AVL_NODE_S **ppChild;
+
+    if (childType == AVL_LEFT) {
+        ppChild = &pParent->left;
+    } else {
+        ppChild = &pParent->right;
+    }
+
+    /* 上层调用保证此处pPreNode一定不为空 */
+    pPreNode = AvlPreNodeFind(pNode);
+    pNewChild = pPreNode->left;
+
+    pPreNode->right = pNode->right;
+    /* 上层调用保证此处pNode的右子女一定不为空 */
+    pNode->right->parent = pPreNode;
+
+    /* 直接前驱是pNode的左子女 */
+    if (pPreNode == pNode->left) {
+        childType = AVL_LEFT;
+        pNewParent = pPreNode;
+    } else {
+        pPreNode->left = pNode->left;
+        /* 上层调用保证此处pNode的左子女一定不为空 */
+        pNode->left->parent = pPreNode;
+        childType = AVL_RIGHT;
+        pNewParent = pPreNode->parent;
+    }
+
+    /* 复制高度和平衡因子 */
+    pPreNode->height = pNode->height;
+    pPreNode->bFactor = pNode->bFactor;
+
+    pPreNode->parent = pParent;
+    *ppChild = pPreNode;
+    
+    *ppParent = pNewParent;
+    *pChildType = childType;
+    *ppNewChild = pNewChild;
+}
+
 int AvlTreeRemove(AVL_TREE_S *pAvlTree, void *key)
 {
     AVL_NODE_S *pAvlNode;
     AVL_NODE_S *pPreNode;
     AVL_NODE_S *pParent;
+    AVL_NODE_S *pNewChild;
+    AvlChildType childType;
 
     /* 参数合法性校验 */
-    if ((pAvlTree == NULL) || (key == NULL)) {
+    if ((pAvlTree == NULL) || (pAvlTree->cmpFunc == NULL) || (key == NULL)) {
         return AVL_ERR;
     }
 
@@ -506,44 +469,57 @@ int AvlTreeRemove(AVL_TREE_S *pAvlTree, void *key)
         return AVL_ERR;
     }
 
-    /* 是否具有两个子女，如果有两个子女，使用直接前驱替换 */
-    if ((pAvlNode->left != NULL) && (pAvlNode->right != NULL)) {
-        /* 查找直接前驱 */
-        pPreNode = AvlPreNodeFind(pAvlNode);
-
-        /* 摘除直接前驱节点, pPreNode及其父节点一定不为空 */
-        pParent = pPreNode->parent;
-        pParent->right = pPreNode->left;
-        if (pPreNode->left != NULL) {
-            pPreNode->left->parent = pParent;
-        }
-
-        /* 使用直接前驱替换 */
-        AvlNodeReplace(pAvlNode, pPreNode, &pAvlTree->root);
-        AvlBalanceAndHeightSet(pPreNode);
+    /* dumRoot的使用保证此处pParent一定不为空 */
+    pParent = pAvlNode->parent;
+    if (pParent->left == pAvlNode) {
+        childType = AVL_LEFT;
     } else {
-        pParent = pAvlNode->parent;
-        AvlEdgeNodeRemove(pAvlNode, &pAvlTree->root);
+        childType = AVL_RIGHT;
     }
 
-    /* 删除节点 */
+    /* 判断是否有两个子女，如果有两个子女，需要使用直接前驱替换 */
+    if (pAvlNode->left == NULL) {
+        pNewChild = pAvlNode->right;
+    } else if (pAvlNode->right == NULL) {
+        pNewChild = pAvlNode->left;
+    } else {
+        /* 存在两个子女，将pAvlNode替换为直接前驱，并在原直接前驱处链接 */
+        AvlNodeTransplant(pAvlNode, &pParent, &childType, &pNewChild);
+    }
+
+    /* 重新链接 */
+    if (pNewChild != NULL) {
+        pNewChild->parent = pParent;
+    }
+    if (childType == AVL_LEFT) {
+        pParent->left = pNewChild;
+    } else {
+        pParent->right = pNewChild;
+    }
+
+    /* 释放结点 */
     AvlNodeFree(pAvlNode);
 
     /* 删除节点后再平衡 */
-    AvlTreeRemoveBalance(pParent, &pAvlTree->root);
+    AvlTreeRemoveBalance(pParent, &pAvlTree->dumRoot);
 
     return AVL_OK;
 }
 
 /* 查找节点 */
-int AvlTreeGetData(AVL_TREE_S *pAvlTree, void *key, void *dataBuff, unsigned int buffSize)
+int AvlTreeGetData(AVL_TREE_S *pAvlTree, void *key, void *dataBuff, uint32_t buffSize)
 {
     AVL_NODE_S *pAvlNode = AvlNodeFind(pAvlTree, key);
     if (pAvlNode == NULL) {
         return AVL_ERR;
     }
 
-    (void)memcpy(dataBuff, pAvlNode->data, buffSize);
+    if (buffSize <= AVL_BYTES_COPY_LEN) {
+        AvlBytesCopy(dataBuff, pAvlNode->data, buffSize);
+    } else {
+        (void)memcpy(dataBuff, pAvlNode->data, buffSize);
+    }
+
     return AVL_OK;
 }
 
@@ -554,12 +530,12 @@ void AvlTreeDestroy(AVL_TREE_S *pAvlTree)
 }
 
 /* 获取avl树高度 */
-unsigned int AvlTreeGetHeight(AVL_TREE_S *pAvlTree)
+uint32_t AvlTreeGetHeight(AVL_TREE_S *pAvlTree)
 {
-    if ((pAvlTree == NULL) || (pAvlTree->root == NULL)) {
+    if ((pAvlTree == NULL) || (pAvlTree->dumRoot.left == NULL)) {
         return 0;
     }
 
-    return (unsigned int)pAvlTree->root->height;
+    return (uint32_t)pAvlTree->dumRoot.left->height;
 }
 
